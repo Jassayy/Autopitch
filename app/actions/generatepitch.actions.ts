@@ -4,6 +4,10 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 import sql from "@/lib/db";
 import { auth } from "@clerk/nextjs/server";
+import { checkProStatus, countUserPitches } from "./user.actions";
+
+// Constants
+const FREE_PITCH_LIMIT = 5; // Maximum number of pitches for free users
 
 // 1. Define Zod schema with refined validation
 const formSchema = z.object({
@@ -24,7 +28,7 @@ export type PitchFormData = z.infer<typeof formSchema>;
 // 2. AI Pitch Generator
 export async function generatePitch(
      formData: PitchFormData
-): Promise<{ success: boolean; message?: string; pitch?: string }> {
+): Promise<{ success: boolean; message?: string; pitch?: string; isPro?: boolean; pitchCount?: number }> {
      try {
           // Get user ID from Clerk
           const session = await auth();
@@ -35,33 +39,35 @@ export async function generatePitch(
                };
           }
 
+          // Check if user is Pro
+          const proStatus = await checkProStatus();
+          const isPro = proStatus.success && proStatus.isPro;
+          
+          // Check pitch count for non-Pro users
+          if (!isPro) {
+               const pitchCount = await countUserPitches();
+               if (pitchCount.success && pitchCount.count >= FREE_PITCH_LIMIT) {
+                    return {
+                         success: false,
+                         message: `Free users can only generate ${FREE_PITCH_LIMIT} pitches. Please upgrade to Pro for unlimited pitches.`,
+                         isPro: false,
+                         pitchCount: pitchCount.count
+                    };
+               }
+          }
+
           // Validate input
           const validatedData = formSchema.parse(formData);
-
-          // Check if user is Pro (in a real app, you would query this from your subscription system)
-          const isPro = await checkIfUserIsPro(session.userId);
 
           // Initialize Gemini
           const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
           const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-          // Use custom prompt if provided and user is Pro, otherwise use default prompt
+          // Use custom prompt if provided and user is Pro
           let prompt;
-
-          if (
-               isPro &&
-               validatedData.customPrompt &&
-               validatedData.customPrompt.trim().length > 0
-          ) {
-               // Replace template variables in custom prompt
-               prompt = validatedData.customPrompt
-                    .replace(/{{prospect_name}}/g, validatedData.prospectName)
-                    .replace(/{{job_title}}/g, validatedData.jobTitle)
-                    .replace(/{{company}}/g, validatedData.company)
-                    .replace(/{{pain_point}}/g, validatedData.painPoint)
-                    .replace(/{{description}}/g, validatedData.description);
+          if (isPro && validatedData.customPrompt) {
+               prompt = validatedData.customPrompt;
           } else {
-               // Default prompt
                prompt = `
       Write a 120-250 word professional cold email with:
       - Recipient: ${validatedData.prospectName}, ${validatedData.jobTitle} at ${validatedData.company}
@@ -79,27 +85,14 @@ export async function generatePitch(
     `;
           }
 
-          // Generate content with streaming
-          const result = await model.generateContentStream(prompt);
-          let fullPitch = "";
-
-          // Stream the response
-          for await (const chunk of result.stream) {
-               const chunkText = chunk.text();
-               fullPitch += chunkText;
-               // Emit the chunk through SSE
-               if (typeof window !== "undefined") {
-                    const event = new CustomEvent("pitch-chunk", {
-                         detail: chunkText,
-                    });
-                    window.dispatchEvent(event);
-               }
-          }
+          // Generate content
+          const result = await model.generateContent(prompt);
+          const fullPitch = result.response.text();
 
           const subjectLine = `Subject: Quick question about ${validatedData.company}\n\n`;
           const completePitch = subjectLine + fullPitch;
 
-          // Store in database with custom prompt if applicable
+          // Store in database
           await sql`
                INSERT INTO pitches (
                     user_id,
@@ -119,15 +112,20 @@ export async function generatePitch(
                     ${validatedData.painPoint},
                     ${validatedData.description},
                     ${completePitch},
-                    ${isPro ? true : false},
-                    ${isPro ? validatedData.stripe_id || null : null}
+                    ${isPro},
+                    ${proStatus.success ? proStatus.stripe_id : null}
                )
           `;
+
+          // Update pitch count for non-Pro users
+          const updatedPitchCount = isPro ? null : (await countUserPitches()).count;
 
           // Return success
           return {
                success: true,
                pitch: completePitch,
+               isPro,
+               pitchCount: updatedPitchCount || 0
           };
      } catch (error) {
           // Handle specific errors
@@ -153,27 +151,6 @@ export async function generatePitch(
      }
 }
 
-// Check if a user has Pro status
-async function checkIfUserIsPro(userId: string): Promise<boolean> {
-     try {
-          // In a real application, you would query your subscription service/database
-          // This is a placeholder implementation
-          const result = await sql`
-               SELECT is_pro FROM users WHERE id = ${userId} LIMIT 1
-          `;
-
-          // If user record exists and has pro status
-          if (result && result.length > 0) {
-               return result[0].is_pro === true;
-          }
-
-          return false; // Default to free tier if no record found
-     } catch (error) {
-          console.error("Error checking pro status:", error);
-          return false; // Default to free tier on error
-     }
-}
-
 interface Pitch {
      id: number;
      prospect_name: string;
@@ -182,8 +159,9 @@ interface Pitch {
      pain_point: string;
      your_offer: string;
      generated_pitch: string;
-     custom_prompt?: string;
      created_at: string;
+     is_pro: boolean;
+     stripe_id?: string;
 }
 
 // 3. Fetch Pitches
@@ -191,6 +169,7 @@ export async function fetchPitches(): Promise<{
      success: boolean;
      message?: string;
      pitches?: Pitch[];
+     isPro?: boolean;
 }> {
      try {
           const session = await auth();
@@ -201,6 +180,9 @@ export async function fetchPitches(): Promise<{
                };
           }
 
+          // Check if user is Pro
+          const proStatus = await checkProStatus();
+
           const result = await sql`
                SELECT 
                     id,
@@ -210,8 +192,9 @@ export async function fetchPitches(): Promise<{
                     pain_point,
                     your_offer,
                     generated_pitch,
-                    custom_prompt,
-                    created_at
+                    created_at,
+                    is_pro,
+                    stripe_id
                FROM pitches 
                WHERE user_id = ${session.userId}
                ORDER BY created_at DESC
@@ -222,6 +205,7 @@ export async function fetchPitches(): Promise<{
           return {
                success: true,
                pitches,
+               isPro: proStatus.success && proStatus.isPro
           };
      } catch (error) {
           console.error("Error fetching pitches:", error);
@@ -237,6 +221,8 @@ export async function fetchLatestPitch(): Promise<{
      success: boolean;
      message?: string;
      pitch?: Pitch;
+     isPro?: boolean;
+     pitchCount?: number;
 }> {
      try {
           const session = await auth();
@@ -247,6 +233,12 @@ export async function fetchLatestPitch(): Promise<{
                };
           }
 
+          // Check if user is Pro
+          const proStatus = await checkProStatus();
+          
+          // Get pitch count
+          const pitchCount = await countUserPitches();
+
           const result = await sql`
                SELECT 
                     id,
@@ -256,8 +248,9 @@ export async function fetchLatestPitch(): Promise<{
                     pain_point,
                     your_offer,
                     generated_pitch,
-                    custom_prompt,
-                    created_at
+                    created_at,
+                    is_pro,
+                    stripe_id
                FROM pitches 
                WHERE user_id = ${session.userId}
                ORDER BY created_at DESC
@@ -268,6 +261,8 @@ export async function fetchLatestPitch(): Promise<{
                return {
                     success: true,
                     pitch: undefined,
+                    isPro: proStatus.success && proStatus.isPro,
+                    pitchCount: pitchCount.success ? pitchCount.count : 0
                };
           }
 
@@ -276,6 +271,8 @@ export async function fetchLatestPitch(): Promise<{
           return {
                success: true,
                pitch,
+               isPro: proStatus.success && proStatus.isPro,
+               pitchCount: pitchCount.success ? pitchCount.count : 0
           };
      } catch (error) {
           console.error("Error fetching latest pitch:", error);
