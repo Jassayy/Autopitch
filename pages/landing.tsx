@@ -172,7 +172,7 @@ const Landing = () => {
                                                        d="M5 13l4 4L19 7"
                                                   />
                                              </svg>
-                                             <span>100 emails per month</span>
+                                             <span>Unlimited emails</span>
                                         </li>
                                         <li className="flex items-center">
                                              <svg
